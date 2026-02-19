@@ -1,10 +1,13 @@
-package main
+package models
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -95,16 +98,37 @@ func (m DownloadInstallModel) View() string {
 	case "checking":
 		return "Checking installed languages...\n"
 	case "prompting":
+		var output string
+
+		// Show all checked languages and their status
+		output += "\n=== Installation Status ===\n"
+		for _, lang := range m.selectedLanguages {
+			status := m.installationStatus[lang]
+			if status == nil {
+				continue
+			}
+			output += formatStatusLine(lang, status)
+		}
+
+		output += "\n"
+
+		// Show the current prompt
 		if m.currentIndex >= len(m.selectedLanguages) {
-			return ""
+			return output
 		}
 		lang := m.selectedLanguages[m.currentIndex]
 		status := m.installationStatus[lang]
-		return formatPrompt(lang, status)
+		output += formatPrompt(lang, status)
+		return output
 	case "installing":
 		return "Installing selected languages...\n"
 	case "complete":
-		return "Installation complete!\n"
+		var output string
+		output += "\n=== Installation Complete ===\n"
+		for lang, result := range m.userChoices {
+			output += fmt.Sprintf("%s: %s\n", lang, result)
+		}
+		return output
 	default:
 		return ""
 	}
@@ -144,7 +168,6 @@ func checkInstalledLanguages(languages []string) tea.Cmd {
 // checkLanguageInstallation checks if a language is installed and gets its version
 func checkLanguageInstallation(language string) (bool, string, string) {
 	var cmd *exec.Cmd
-
 	switch strings.ToLower(language) {
 	case "go":
 		cmd = exec.Command("go", "version")
@@ -184,9 +207,25 @@ func parseVersion(output, language string) string {
 	return "unknown"
 }
 
+func createSecureClient() *http.Client {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12, // Minimum TLS 1.2
+		},
+		DisableCompression: false,
+		MaxIdleConns:       100,
+		IdleConnTimeout:    90 * time.Second,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
+	}
+}
+
 // getLatestVersion gets the latest version of a language (simplified)
 func getLatestVersion(language string) string {
-	// This is a placeholder - in production, you'd fetch from official sources
+
 	latestVersions := map[string]string{
 		"go":     "1.25.5",
 		"python": "3.13.0",
@@ -195,6 +234,19 @@ func getLatestVersion(language string) string {
 		"java":   "21",
 	}
 	return latestVersions[strings.ToLower(language)]
+}
+
+// formatStatusLine formats the installation status for display
+func formatStatusLine(language string, status *InstallationStatus) string {
+	if !status.Installed {
+		return fmt.Sprintf("  ❌ %s: NOT INSTALLED\n", language)
+	}
+
+	if status.Version == status.LatestVersion {
+		return fmt.Sprintf("  ✅ %s: %s (latest)\n", language, status.Version)
+	}
+
+	return fmt.Sprintf("  ⚠️  %s: %s (latest: %s)\n", language, status.Version, status.LatestVersion)
 }
 
 // formatPrompt formats the installation prompt for the user
@@ -307,6 +359,7 @@ func installGo() error {
 
 func installPython() error {
 	if runtime.GOOS == "darwin" {
+		fmt.Println("Installing Python using Homebrew...")
 		cmd := exec.Command("brew", "install", "python@3.13")
 		return cmd.Run()
 	}

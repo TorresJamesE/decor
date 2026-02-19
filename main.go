@@ -4,32 +4,33 @@ import (
 	"fmt"
 	"os"
 
+	"decor/models"
+
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-type mainModel struct {
-	activeModel     Decor
-	models          []Decor
+type MainModel struct {
+	activeModel     tea.Model
+	models          []tea.Model
 	currentModelIdx int
 }
 
-func (m mainModel) InitialModel() mainModel {
+func (m MainModel) InitialModel() MainModel {
 
-	m = mainModel{
+	m = MainModel{
 		currentModelIdx: 0,
-		models:          []Decor{LanguageModel{}.InitialModel()},
+		models:          []tea.Model{models.LanguageModel{}.InitialModel()},
 	}
 
 	m.activeModel = m.models[0]
-
 	return m
 }
 
-func (m mainModel) Init() tea.Cmd {
-	return nil
+func (m MainModel) Init() tea.Cmd {
+	return m.activeModel.Init()
 }
 
-func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m MainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
@@ -39,27 +40,32 @@ func (m mainModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "n":
 			if m.currentModelIdx+1 > len(m.models)-1 {
-				m.activeModel = m.models[0]
-				break
+				newModel := models.NewDownloadInstallModel(m.activeModel.(models.Decor).Selections())
+				m.models = append(m.models, newModel)
+				m.activeModel = newModel
+				m.currentModelIdx = len(m.models) - 1
+				return m, newModel.Init()
 			}
-			m.activeModel = m.models[m.currentModelIdx+1]
+			m.currentModelIdx++
+			m.activeModel = m.models[m.currentModelIdx]
 		}
 	}
 
-	m.activeModel, cmd = m.activeModel.Update(msg)
+	updatedModel, cmd := m.activeModel.Update(msg)
+	m.activeModel = updatedModel
+	m.models[m.currentModelIdx] = updatedModel
 	return m, cmd
 }
 
-func (m mainModel) View() string {
-	return fmt.Sprintf(
-		"%s\n\nPress q to quit. Press c to continue.",
-		m.activeModel.View(),
-	)
+func (m MainModel) View() string {
+	return m.activeModel.View()
 }
 
 func main() {
-	mainModel := mainModel{}.InitialModel()
-	p := tea.NewProgram(mainModel)
+	fmt.Printf("Welcome to Decor! This tool will help you install ('decorate') your environment with what you need.\n\n")
+
+	MainModel := MainModel{}.InitialModel()
+	p := tea.NewProgram(MainModel)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Alas, there's been an error: %v", err)

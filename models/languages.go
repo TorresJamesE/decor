@@ -1,7 +1,8 @@
-package main
+package models
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -54,6 +55,11 @@ func (m Decor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.choices)-1 {
 				m.cursor++
 			}
+		case "n":
+			// This is where we would transition to the next model, passing the selected languages.
+			selectedLanguages := m.Selections()
+			fmt.Printf("Selected languages: %s\n", strings.Join(selectedLanguages, ", "))
+			return NewDownloadInstallModel(m.Selections()), nil // This is just a placeholder. You would return the new model here.
 
 		// The "enter" key and the spacebar (a literal space) toggle
 		// the selected state for the item that the cursor is pointing at.
@@ -74,7 +80,8 @@ func (m Decor) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Decor) View() string {
 	// The header
-	s := "What programming language(s) do you want to install?\n\n"
+	var s strings.Builder
+	s.WriteString("What programming language(s) do you want to install?\n\n")
 
 	// Iterate over our choices
 	for i, choice := range m.choices {
@@ -92,9 +99,10 @@ func (m Decor) View() string {
 		}
 
 		// Render the row
-		s += fmt.Sprintf("%s [%s] %s\n", cursor, checked, choice)
+		fmt.Fprintf(&s, "%s [%s] %s\n", cursor, checked, choice)
 	}
 
 	// Send the UI for rendering
-	return s
+	fmt.Fprintln(&s, "\nPress space or enter to select.\nPress up/down or k/j to navigate. \nPress n to continue. \nPress q or ctrl+c to quit.")
+	return s.String()
 }
