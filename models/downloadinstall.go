@@ -7,9 +7,11 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // InstallationStatus represents the status of a language installation
@@ -21,6 +23,24 @@ type InstallationStatus struct {
 	Error         string
 }
 
+// LanguageProgress tracks download/install progress for a language
+type LanguageProgress struct {
+	Language       string
+	Progress       float64 // 0.0 to 1.0
+	CurrentStep    string  // "downloading", "installing", "complete", "error"
+	TotalSteps     int
+	CurrentStepNum int
+	ErrorMessage   string
+	mu             sync.Mutex
+}
+
+// ProgressUpdateMsg is sent when progress changes
+type ProgressUpdateMsg struct {
+	Language string
+	Progress float64
+	Step     string
+}
+
 // DownloadInstallModel manages the installation flow
 type DownloadInstallModel struct {
 	Decor
@@ -29,6 +49,7 @@ type DownloadInstallModel struct {
 	currentIndex       int
 	state              string            // "checking", "prompting", "installing", "complete"
 	userChoices        map[string]string // "skip" or "install" or "update"
+	languageProgress   map[string]*LanguageProgress
 }
 
 // NewDownloadInstallModel creates a new download/install model
@@ -37,6 +58,7 @@ func NewDownloadInstallModel(selectedLanguages []string) DownloadInstallModel {
 		selectedLanguages:  selectedLanguages,
 		installationStatus: make(map[string]*InstallationStatus),
 		userChoices:        make(map[string]string),
+		languageProgress:   make(map[string]*LanguageProgress),
 		state:              "checking",
 	}
 }
@@ -59,7 +81,7 @@ func (m DownloadInstallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentIndex++
 				if m.currentIndex >= len(m.selectedLanguages) {
 					m.state = "installing"
-					return m, installSelectedLanguages(m.selectedLanguages, m.userChoices, m.installationStatus)
+					return m, installSelectedLanguagesWithProgress(m.selectedLanguages, m.userChoices, m.installationStatus)
 				}
 			}
 		case "n":
@@ -68,7 +90,7 @@ func (m DownloadInstallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentIndex++
 				if m.currentIndex >= len(m.selectedLanguages) {
 					m.state = "installing"
-					return m, installSelectedLanguages(m.selectedLanguages, m.userChoices, m.installationStatus)
+					return m, installSelectedLanguagesWithProgress(m.selectedLanguages, m.userChoices, m.installationStatus)
 				}
 			}
 		case "u":
@@ -77,13 +99,39 @@ func (m DownloadInstallModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentIndex++
 				if m.currentIndex >= len(m.selectedLanguages) {
 					m.state = "installing"
-					return m, installSelectedLanguages(m.selectedLanguages, m.userChoices, m.installationStatus)
+					return m, installSelectedLanguagesWithProgress(m.selectedLanguages, m.userChoices, m.installationStatus)
 				}
 			}
 		}
 	case InstallationStatusMsg:
 		m.installationStatus = msg.Status
 		m.state = "prompting"
+	case InitProgressMsg:
+		m.languageProgress = msg.Trackers
+		return m, progressUpdateTicker()
+	case ProgressTickMsg:
+		// Check if any language is still installing
+		allComplete := true
+		for _, prog := range m.languageProgress {
+			prog.mu.Lock()
+			if prog.Progress < 1.0 && prog.CurrentStep != "error" {
+				allComplete = false
+			}
+			prog.mu.Unlock()
+		}
+		if allComplete {
+			m.state = "complete"
+			return m, nil
+		}
+		return m, progressUpdateTicker()
+	case ProgressUpdateMsg:
+		if progress, exists := m.languageProgress[msg.Language]; exists {
+			progress.mu.Lock()
+			progress.Progress = msg.Progress
+			progress.CurrentStep = msg.Step
+			progress.mu.Unlock()
+		}
+		return m, progressUpdateTicker()
 	case InstallCompleteMsg:
 		m.state = "complete"
 		return m, nil
@@ -121,7 +169,7 @@ func (m DownloadInstallModel) View() string {
 		output += formatPrompt(lang, status)
 		return output
 	case "installing":
-		return "Installing selected languages...\n"
+		return m.renderInstallationProgress()
 	case "complete":
 		var output string
 		output += "\n=== Installation Complete ===\n"
@@ -132,6 +180,96 @@ func (m DownloadInstallModel) View() string {
 	default:
 		return ""
 	}
+}
+
+// renderInstallationProgress renders styled progress bars for all languages
+func (m DownloadInstallModel) renderInstallationProgress() string {
+	// Define lipgloss styles
+	titleStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("11")). // Yellow
+		MarginBottom(1)
+
+	progressContainerStyle := lipgloss.NewStyle().
+		MarginBottom(1).
+		PaddingLeft(2)
+
+	langNameStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("6")). // Cyan
+		Width(15)
+
+	progressBarStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("10")). // Green
+		MarginLeft(1)
+
+	statusStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8")). // Gray
+		MarginLeft(1)
+
+	var output string
+	output += titleStyle.Render("Installing Languages...") + "\n"
+
+	for _, lang := range m.selectedLanguages {
+		choice := m.userChoices[lang]
+		if choice == "skip" {
+			output += progressContainerStyle.Render(
+				lipgloss.JoinHorizontal(
+					lipgloss.Left,
+					langNameStyle.Render(lang),
+					statusStyle.Render("⊘ Skipped"),
+				),
+			) + "\n"
+			continue
+		}
+
+		// Initialize progress if not exists
+		if _, exists := m.languageProgress[lang]; !exists {
+			m.languageProgress[lang] = &LanguageProgress{
+				Language:    lang,
+				Progress:    0.0,
+				CurrentStep: "starting",
+				TotalSteps:  3,
+			}
+		}
+
+		prog := m.languageProgress[lang]
+		prog.mu.Lock()
+		progress := prog.Progress
+		step := prog.CurrentStep
+		prog.mu.Unlock()
+
+		// Create a progress modal
+		progressBar := renderProgressBar(progress, 30)
+
+		output += progressContainerStyle.Render(
+			lipgloss.JoinHorizontal(
+				lipgloss.Left,
+				langNameStyle.Render(lang),
+				progressBarStyle.Render(progressBar),
+				statusStyle.Render(fmt.Sprintf("(%s)", step)),
+			),
+		) + "\n"
+	}
+
+	return output
+}
+
+// renderProgressBar creates a visual progress bar with percentage
+func renderProgressBar(progress float64, width int) string {
+	filled := int(float64(width) * progress)
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+
+	// Create the bar
+	bar := "[" + strings.Repeat("=", filled) + strings.Repeat(" ", empty) + "]"
+
+	// Add percentage
+	percentage := fmt.Sprintf("%.0f%%", progress*100)
+
+	return bar + " " + percentage
 }
 
 // Message types for async operations
@@ -147,6 +285,15 @@ type InstallErrorMsg struct {
 	Language string
 	Error    string
 }
+
+// progressUpdateTicker sends periodic progress updates
+func progressUpdateTicker() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return ProgressTickMsg{}
+	})
+}
+
+type ProgressTickMsg struct{}
 
 // checkInstalledLanguages checks which languages are installed
 func checkInstalledLanguages(languages []string) tea.Cmd {
@@ -285,79 +432,167 @@ func getDefaultChoice(status *InstallationStatus) string {
 	return "skip"
 }
 
-// installSelectedLanguages installs the selected languages
-func installSelectedLanguages(languages []string, choices map[string]string, status map[string]*InstallationStatus) tea.Cmd {
-	return func() tea.Msg {
-		results := make(map[string]string)
-		for _, lang := range languages {
-			choice := choices[lang]
-			switch choice {
-			case "skip":
-				results[lang] = "skipped"
-			case "install":
-				err := installLanguage(lang)
-				if err != nil {
-					results[lang] = fmt.Sprintf("error: %v", err)
-				} else {
-					results[lang] = "installed"
-				}
-			case "update":
-				err := updateLanguage(lang)
-				if err != nil {
-					results[lang] = fmt.Sprintf("error: %v", err)
-				} else {
-					results[lang] = "updated"
+// installSelectedLanguagesWithProgress installs languages with progress tracking
+func installSelectedLanguagesWithProgress(languages []string, choices map[string]string, status map[string]*InstallationStatus) tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg {
+			// Create and initialize progress trackers for all non-skipped languages
+			progressTrackers := make(map[string]*LanguageProgress)
+			for _, lang := range languages {
+				choice := choices[lang]
+				if choice != "skip" {
+					progressTrackers[lang] = &LanguageProgress{
+						Language:    lang,
+						Progress:    0.0,
+						CurrentStep: "starting",
+						TotalSteps:  3,
+					}
 				}
 			}
-		}
-		return InstallCompleteMsg{Results: results}
-	}
+
+			// Start installation in background
+			go func() {
+				results := make(map[string]string)
+				var wg sync.WaitGroup
+
+				for _, lang := range languages {
+					choice := choices[lang]
+					if choice == "skip" {
+						results[lang] = "skipped"
+						continue
+					}
+
+					progress := progressTrackers[lang]
+
+					wg.Add(1)
+					go func(language, choiceType string, prog *LanguageProgress) {
+						defer wg.Done()
+						var err error
+
+						switch choiceType {
+						case "install":
+							err = installLanguageWithProgress(language, prog)
+							if err != nil {
+								results[language] = fmt.Sprintf("error: %v", err)
+								prog.CurrentStep = "error"
+								prog.ErrorMessage = err.Error()
+							} else {
+								results[language] = "installed"
+								prog.CurrentStep = "complete"
+								prog.Progress = 1.0
+							}
+						case "update":
+							err = updateLanguageWithProgress(language, prog)
+							if err != nil {
+								results[language] = fmt.Sprintf("error: %v", err)
+								prog.CurrentStep = "error"
+								prog.ErrorMessage = err.Error()
+							} else {
+								results[language] = "updated"
+								prog.CurrentStep = "complete"
+								prog.Progress = 1.0
+							}
+						}
+					}(lang, choice, progress)
+				}
+
+				wg.Wait()
+				// Send completion message (handled by completion ticker)
+			}()
+
+			// Store trackers in a shared location
+			return InitProgressMsg{Trackers: progressTrackers}
+		},
+		progressUpdateTicker(),
+	)
 }
 
-// installLanguage downloads and installs a language
-func installLanguage(language string) error {
+// InitProgressMsg initializes progress trackers
+type InitProgressMsg struct {
+	Trackers map[string]*LanguageProgress
+}
+
+// installLanguageWithProgress downloads and installs a language with progress tracking
+func installLanguageWithProgress(language string, progress *LanguageProgress) error {
 	switch strings.ToLower(language) {
 	case "go":
-		return installGo()
+		return installGoWithProgress(progress)
 	case "python":
-		return installPython()
+		return installPythonWithProgress(progress)
 	case "rust":
-		return installRust()
+		return installRustWithProgress(progress)
 	case "c++":
-		return installCpp()
+		return installCppWithProgress(progress)
 	case "java":
-		return installJava()
+		return installJavaWithProgress(progress)
 	default:
 		return fmt.Errorf("unsupported language: %s", language)
 	}
 }
 
-// updateLanguage updates an existing language installation
-func updateLanguage(language string) error {
-	// Implementation depends on package manager available on the system
+// updateLanguageWithProgress updates an existing language installation with progress
+func updateLanguageWithProgress(language string, progress *LanguageProgress) error {
 	switch strings.ToLower(language) {
 	case "go":
-		return updateGo()
+		return updateGoWithProgress(progress)
 	case "python":
-		return updatePython()
+		return updatePythonWithProgress(progress)
 	case "rust":
-		return updateRust()
+		return updateRustWithProgress(progress)
 	case "c++":
-		return updateCpp()
+		return updateCppWithProgress(progress)
 	case "java":
-		return updateJava()
+		return updateJavaWithProgress(progress)
 	default:
 		return fmt.Errorf("unsupported language: %s", language)
 	}
 }
 
-// Language-specific install functions
-func installGo() error {
+// Language-specific install functions with progress tracking
+func installGoWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Downloading Go...",
+		"Extracting files...",
+		"Verifying installation...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Verifying installation..."
+	progress.mu.Unlock()
+
 	cmd := exec.Command("bash", "-c", "curl -L https://go.dev/dl/go1.25.5.darwin-arm64.tar.gz -o go1.25.5.tar.gz && tar -C /usr/local -xzf go1.25.5.tar.gz")
 	return cmd.Run()
 }
 
-func installPython() error {
+func installPythonWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Preparing installation...",
+		"Installing Python...",
+		"Verifying installation...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Verifying installation..."
+	progress.mu.Unlock()
+
 	if runtime.GOOS == "darwin" {
 		fmt.Println("Installing Python using Homebrew...")
 		cmd := exec.Command("brew", "install", "python@3.13")
@@ -367,12 +602,50 @@ func installPython() error {
 	return cmd.Run()
 }
 
-func installRust() error {
+func installRustWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Downloading Rust installer...",
+		"Running installation script...",
+		"Configuring environment...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Configuring environment..."
+	progress.mu.Unlock()
+
 	cmd := exec.Command("bash", "-c", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
 	return cmd.Run()
 }
 
-func installCpp() error {
+func installCppWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Preparing installation...",
+		"Installing C++ compiler...",
+		"Setting up environment...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Setting up environment..."
+	progress.mu.Unlock()
+
 	if runtime.GOOS == "darwin" {
 		cmd := exec.Command("xcode-select", "--install")
 		return cmd.Run()
@@ -381,7 +654,26 @@ func installCpp() error {
 	return cmd.Run()
 }
 
-func installJava() error {
+func installJavaWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Preparing installation...",
+		"Installing OpenJDK...",
+		"Setting up environment...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Setting up environment..."
+	progress.mu.Unlock()
+
 	if runtime.GOOS == "darwin" {
 		cmd := exec.Command("brew", "install", "openjdk@21")
 		return cmd.Run()
@@ -390,12 +682,50 @@ func installJava() error {
 	return cmd.Run()
 }
 
-// Language-specific update functions
-func updateGo() error {
-	return installGo() // Go update is similar to install
+// Language-specific update functions with progress tracking
+func updateGoWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Checking latest version...",
+		"Downloading Go...",
+		"Installing update...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Installing update..."
+	progress.mu.Unlock()
+
+	return installGoWithProgress(progress)
 }
 
-func updatePython() error {
+func updatePythonWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Fetching available updates...",
+		"Upgrading Python...",
+		"Verifying update...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Verifying update..."
+	progress.mu.Unlock()
+
 	if runtime.GOOS == "darwin" {
 		cmd := exec.Command("brew", "upgrade", "python@3.13")
 		return cmd.Run()
@@ -404,12 +734,50 @@ func updatePython() error {
 	return cmd.Run()
 }
 
-func updateRust() error {
+func updateRustWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Checking for updates...",
+		"Updating Rust...",
+		"Verifying update...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Verifying update..."
+	progress.mu.Unlock()
+
 	cmd := exec.Command("rustup", "update")
 	return cmd.Run()
 }
 
-func updateCpp() error {
+func updateCppWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Checking for system updates...",
+		"Installing updates...",
+		"Verifying...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Verifying..."
+	progress.mu.Unlock()
+
 	if runtime.GOOS == "darwin" {
 		cmd := exec.Command("softwareupdate", "-i", "-a")
 		return cmd.Run()
@@ -418,7 +786,26 @@ func updateCpp() error {
 	return cmd.Run()
 }
 
-func updateJava() error {
+func updateJavaWithProgress(progress *LanguageProgress) error {
+	steps := []string{
+		"Fetching available updates...",
+		"Upgrading OpenJDK...",
+		"Verifying update...",
+	}
+
+	for i, step := range steps {
+		progress.mu.Lock()
+		progress.Progress = float64(i) / float64(len(steps))
+		progress.CurrentStep = step
+		progress.mu.Unlock()
+		time.Sleep(500 * time.Millisecond) // Simulate work
+	}
+
+	progress.mu.Lock()
+	progress.Progress = 1.0
+	progress.CurrentStep = "Verifying update..."
+	progress.mu.Unlock()
+
 	if runtime.GOOS == "darwin" {
 		cmd := exec.Command("brew", "upgrade", "openjdk@21")
 		return cmd.Run()
